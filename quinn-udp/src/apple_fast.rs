@@ -65,7 +65,27 @@ fn send_via_sendmsg_x(
     let Some(sendmsg_x) = state.resolve_apple_fast_fn(sendmsg_x_fn) else {
         return send_single(state, io, transmit);
     };
-    retry_if_interrupted(|| unsafe { sendmsg_x(io.as_raw_fd(), hdrs.as_ptr(), cnt as u32, 0) })?;
+    // `sendmsg_x` behaves like `sendmmsg`: it delivers as many messages as the interface queue
+    // can accept and returns that count, which may be fewer than requested when the queue fills
+    // mid-batch. We must drain the remainder ourselves; otherwise the un-sent tail is silently
+    // dropped (manifesting as upstream packet loss under load).
+    let total = cnt as usize;
+    let mut sent = 0;
+    while sent < total {
+        match retry_if_interrupted(|| unsafe {
+            sendmsg_x(io.as_raw_fd(), hdrs[sent..].as_ptr(), (total - sent) as u32, 0)
+        }) {
+            Ok(n) => sent += n as usize,
+            // Nothing sent yet: surface the error (e.g. `ENOBUFS`) so the caller can back-pressure.
+            Err(e) if sent == 0 => return Err(e),
+            // We already delivered part of the batch; returning would risk a duplicate re-send by
+            // the caller. Retry transient pressure; on a hard error keep what we sent, drop the rest.
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOBUFS) | Some(libc::EAGAIN) => continue,
+                _ => return Ok(()),
+            },
+        }
+    }
     Ok(())
 }
 
