@@ -858,7 +858,12 @@ pub(crate) fn decode_socket_addr(name: &libc::sockaddr_storage) -> io::Result<So
     }
 }
 
-#[cfg(not(apple_slow))]
+#[cfg(apple_fast)]
+// The maximum batch accepted by `sendmsg_x` / `recvmsg_x` under the default
+// `kern.ipc.somaxsendmsgx` / `kern.ipc.somaxrecvmsgx` sysctls.
+pub(crate) const BATCH_SIZE: usize = 256;
+
+#[cfg(not(any(apple_fast, apple_slow)))]
 // Chosen somewhat arbitrarily; might benefit from additional tuning.
 pub(crate) const BATCH_SIZE: usize = 32;
 
