@@ -859,9 +859,10 @@ pub(crate) fn decode_socket_addr(name: &libc::sockaddr_storage) -> io::Result<So
 }
 
 #[cfg(apple_fast)]
-// The maximum batch accepted by `sendmsg_x` / `recvmsg_x` under the default
-// `kern.ipc.somaxsendmsgx` / `kern.ipc.somaxrecvmsgx` sysctls.
-pub(crate) const BATCH_SIZE: usize = 256;
+// Matches Linux' `UDP_MAX_SEGMENTS` GSO/GRO quantum. The kernel accepts up to 256
+// (`kern.ipc.somaxsendmsgx` / `kern.ipc.somaxrecvmsgx`), but the per-call setup cost
+// scales with the batch size, so a larger value hurts when batches don't fill.
+pub(crate) const BATCH_SIZE: usize = 64;
 
 #[cfg(not(any(apple_fast, apple_slow)))]
 // Chosen somewhat arbitrarily; might benefit from additional tuning.
