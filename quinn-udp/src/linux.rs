@@ -87,7 +87,8 @@ impl LinuxError {
         let required =
             unsafe { libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as _) as usize };
 
-        if cmsg.cmsg_len < required {
+        // `cmsg_len` is `usize` on glibc but `u32` on musl.
+        if (cmsg.cmsg_len as usize) < required {
             return None;
         }
 
