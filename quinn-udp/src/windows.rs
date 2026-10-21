@@ -4,21 +4,16 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     os::windows::io::AsRawSocket,
     ptr,
-    sync::{
-        LazyLock, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Instant,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use libc::{c_int, c_uint};
 use windows_sys::Win32::Networking::WinSock;
 
 use crate::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, SendCount, Transmit, UdpSockRef,
+    EcnCodepoint, RecvMeta, SendCount, Transmit, UdpSockRef,
     cmsg::{self, CMsgHdr},
     log::debug,
-    log_sendmsg_error,
 };
 
 /// QUIC-friendly UDP socket for Windows
@@ -26,7 +21,6 @@ use crate::{
 /// Unlike a standard Windows UDP socket, this allows ECN bits to be read and written.
 #[derive(Debug)]
 pub struct UdpSocketState {
-    last_send_error: Mutex<Instant>,
     max_gso_segments: AtomicUsize,
 
     /// Whether the underlying Winsock provider supports IPv4 ECN socket options/control messages.
@@ -37,6 +31,9 @@ pub struct UdpSocketState {
 
     /// Whether the underlying Winsock provider supports IPv6 ECN socket options/control messages.
     ecn_v6_supported: bool,
+
+    /// `WSARecvMsg`, resolved for this socket's Winsock provider.
+    wsa_recvmsg: WsaRecvMsg,
 }
 
 impl UdpSocketState {
@@ -62,18 +59,26 @@ impl UdpSocketState {
         }?;
         let family = info.iAddressFamily;
         let is_ipv6 = family == c_int::from(WinSock::AF_INET6);
-        let v6only = unsafe {
-            get_socket_option::<u32>(&*socket.0, WinSock::IPPROTO_IPV6, WinSock::IPV6_V6ONLY as _)
-        }?;
-        let is_ipv4 = family == c_int::from(WinSock::AF_INET) || v6only == 0;
+        let is_dual_stack = is_ipv6 && {
+            let v6_only = unsafe {
+                get_socket_option::<u32>(
+                    &*socket.0,
+                    WinSock::IPPROTO_IPV6,
+                    WinSock::IPV6_V6ONLY as _,
+                )
+            }?;
+            v6_only == 0
+        };
+
+        let is_ipv4 = family == c_int::from(WinSock::AF_INET) || is_dual_stack;
 
         // We don't support old versions of Windows that do not enable access to `WSARecvMsg()`
-        if WSARECVMSG_PTR.is_none() {
-            return Err(io::Error::new(
+        let wsa_recvmsg = resolve_wsa_recvmsg(&*socket.0).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::Unsupported,
                 "network stack does not support WSARecvMsg function",
-            ));
-        }
+            )
+        })?;
 
         // ECN is best-effort on Windows: if the Winsock provider doesn't support these options
         // (common under Wine/Proton), we disable ECN and keep working.
@@ -149,12 +154,11 @@ impl UdpSocketState {
             }
         }
 
-        let now = Instant::now();
         Ok(Self {
-            last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(max_gso_segments(&*socket.0)),
             ecn_v4_supported,
             ecn_v6_supported,
+            wsa_recvmsg,
         })
     }
 
@@ -180,37 +184,6 @@ impl UdpSocketState {
         )
     }
 
-    /// Sends a [`Transmit`] on the given socket.
-    ///
-    /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`].
-    /// All other errors will be logged and converted to `Ok`.
-    ///
-    /// UDP transmission errors are considered non-fatal because higher-level protocols must
-    /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
-    /// Thus, logging is most likely the only thing you can do with these errors.
-    ///
-    /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
-    /// instead.
-    pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<SendCount> {
-        let transmit = transmit.limit(self.max_gso_segments());
-        let attempted = transmit.datagram_count();
-
-        match send(
-            socket,
-            &transmit,
-            self.ecn_v4_supported,
-            self.ecn_v6_supported,
-        ) {
-            Ok(sent) => Ok(SendCount::from_datagram_count(sent)),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-            Err(e) => {
-                log_sendmsg_error(&self.last_send_error, e, &transmit);
-
-                Ok(SendCount::from_datagram_count(attempted))
-            }
-        }
-    }
-
     /// Sends a prefix of a [`Transmit`] without any additional error handling.
     pub fn try_send(
         &self,
@@ -234,8 +207,6 @@ impl UdpSocketState {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
-        let wsa_recvmsg_ptr = WSARECVMSG_PTR.expect("valid function pointer for WSARecvMsg");
-
         // we cannot use [`socket2::MsgHdrMut`] as we do not have access to inner field which holds the WSAMSG
         let mut ctrl_buf = cmsg::Aligned([0; CMSG_LEN]);
         let mut source: WinSock::SOCKADDR_INET = unsafe { mem::zeroed() };
@@ -260,7 +231,7 @@ impl UdpSocketState {
 
         let mut len = 0;
         unsafe {
-            let rc = (wsa_recvmsg_ptr)(
+            let rc = (self.wsa_recvmsg)(
                 socket.0.as_raw_socket() as usize,
                 &mut wsa_msg,
                 &mut len,
@@ -293,32 +264,30 @@ impl UdpSocketState {
             // [header (len)][data][padding(len + sizeof(data))] -> [header][data][padding]
             match (cmsg.cmsg_level, cmsg.cmsg_type) {
                 (WinSock::IPPROTO_IP, WinSock::IP_PKTINFO) => {
-                    let pktinfo =
-                        unsafe { cmsg::decode::<WinSock::IN_PKTINFO, WinSock::CMSGHDR>(cmsg) };
+                    let pktinfo = unsafe { cmsg.decode::<WinSock::IN_PKTINFO>() };
                     // Addr is stored in big endian format
                     let ip4 = Ipv4Addr::from(u32::from_be(unsafe { pktinfo.ipi_addr.S_un.S_addr }));
                     dst_ip = Some(ip4.into());
                     interface_index = Some(pktinfo.ipi_ifindex);
                 }
                 (WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO) => {
-                    let pktinfo =
-                        unsafe { cmsg::decode::<WinSock::IN6_PKTINFO, WinSock::CMSGHDR>(cmsg) };
+                    let pktinfo = unsafe { cmsg.decode::<WinSock::IN6_PKTINFO>() };
                     // Addr is stored in big endian format
                     dst_ip = Some(IpAddr::from(unsafe { pktinfo.ipi6_addr.u.Byte }));
                     interface_index = Some(pktinfo.ipi6_ifindex);
                 }
                 (WinSock::IPPROTO_IP, WinSock::IP_ECN) => {
                     // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
-                    ecn_bits = unsafe { cmsg::decode::<c_int, WinSock::CMSGHDR>(cmsg) };
+                    ecn_bits = unsafe { cmsg.decode::<c_int>() };
                 }
                 (WinSock::IPPROTO_IPV6, WinSock::IPV6_ECN) => {
                     // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
-                    ecn_bits = unsafe { cmsg::decode::<c_int, WinSock::CMSGHDR>(cmsg) };
+                    ecn_bits = unsafe { cmsg.decode::<c_int>() };
                 }
                 (WinSock::IPPROTO_UDP, UDP_COALESCED_INFO) => {
                     // Has type u32 (aka DWORD) per
                     // https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-udp-socket-options
-                    stride = unsafe { cmsg::decode::<u32, WinSock::CMSGHDR>(cmsg) };
+                    stride = unsafe { cmsg.decode::<u32>() };
                 }
                 _ => {}
             }
@@ -541,31 +510,38 @@ pub(crate) const BATCH_SIZE: usize = 1;
 const CMSG_LEN: usize = 128;
 const OPTION_ON: u32 = 1;
 
-static WSARECVMSG_PTR: LazyLock<WinSock::LPFN_WSARECVMSG> = LazyLock::new(|| {
-    let s = unsafe { WinSock::socket(WinSock::AF_INET as _, WinSock::SOCK_DGRAM as _, 0) };
-    if s == WinSock::INVALID_SOCKET {
-        debug!(
-            "ignoring WSARecvMsg function pointer due to socket creation error: {}",
-            io::Error::last_os_error()
-        );
-        return None;
-    }
+/// Names the function type inside [`WinSock::LPFN_WSARECVMSG`] without restating its signature.
+trait Inner {
+    type Type;
+}
 
+impl<T> Inner for Option<T> {
+    type Type = T;
+}
+
+type WsaRecvMsg = <WinSock::LPFN_WSARECVMSG as Inner>::Type;
+
+/// Resolve `WSARecvMsg` for `socket`.
+///
+/// The pointer belongs to the Winsock provider serving `socket`, so it has to be resolved per
+/// socket: calling one provider's `WSARecvMsg` on another provider's socket crashes when a layered
+/// service provider is installed. See <https://bugzilla.mozilla.org/show_bug.cgi?id=2068899>.
+fn resolve_wsa_recvmsg(socket: &impl AsRawSocket) -> WinSock::LPFN_WSARECVMSG {
     // Detect if OS expose WSARecvMsg API based on
     // https://github.com/Azure/mio-uds-windows/blob/a3c97df82018086add96d8821edb4aa85ec1b42b/src/stdnet/ext.rs#L601
     let guid = WinSock::WSAID_WSARECVMSG;
-    let mut wsa_recvmsg_ptr = None;
+    let mut func = None;
     let mut len = 0;
 
     // Safety: Option handles the NULL pointer with a None value
     let rc = unsafe {
         WinSock::WSAIoctl(
-            s as _,
+            socket.as_raw_socket() as _,
             WinSock::SIO_GET_EXTENSION_FUNCTION_POINTER,
             &guid as *const _ as *const _,
             size_of_val(&guid) as u32,
-            &mut wsa_recvmsg_ptr as *mut _ as *mut _,
-            size_of_val(&wsa_recvmsg_ptr) as u32,
+            &mut func as *mut _ as *mut _,
+            size_of_val(&func) as u32,
             &mut len,
             ptr::null_mut(),
             None,
@@ -577,17 +553,15 @@ static WSARECVMSG_PTR: LazyLock<WinSock::LPFN_WSARECVMSG> = LazyLock::new(|| {
             "ignoring WSARecvMsg function pointer due to ioctl error: {}",
             io::Error::last_os_error()
         );
-    } else if len as usize != size_of::<WinSock::LPFN_WSARECVMSG>() {
+        return None;
+    }
+    if len as usize != size_of_val(&func) {
         debug!("ignoring WSARecvMsg function pointer due to pointer size mismatch");
-        wsa_recvmsg_ptr = None;
+        return None;
     }
 
-    unsafe {
-        WinSock::closesocket(s);
-    }
-
-    wsa_recvmsg_ptr
-});
+    func
+}
 
 fn max_gso_segments(socket: &impl AsRawSocket) -> usize {
     const GSO_SIZE: c_uint = 1500;
@@ -597,8 +571,16 @@ fn max_gso_segments(socket: &impl AsRawSocket) -> usize {
         WinSock::UDP_SEND_MSG_SIZE,
         GSO_SIZE,
     ) {
-        // Empirically found on Windows 11 x64
-        Ok(()) => 512,
+        Ok(()) => {
+            // Disable USO again at the socket level so that it is only enabled per message through
+            // the `UDP_SEND_MSG_SIZE` control message. This mirrors the Linux behaviour, see:
+            // - https://github.com/quinn-rs/quinn/issues/2818
+            // - https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-udp-socket-options
+            let _ = set_socket_option(socket, WinSock::IPPROTO_UDP, WinSock::UDP_SEND_MSG_SIZE, 0);
+
+            // Empirically found on Windows 11 x64
+            512
+        }
         Err(_) => 1,
     }
 }

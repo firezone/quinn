@@ -28,8 +28,8 @@
 #![warn(clippy::use_self)]
 
 use core::time::Duration;
-#[cfg(unix)]
-use std::os::unix::io::AsFd;
+#[cfg(any(unix, target_os = "wasi"))]
+use std::os::fd::AsFd;
 #[cfg(windows)]
 use std::os::windows::io::AsSocket;
 use std::{
@@ -37,8 +37,12 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     num::NonZeroUsize,
 };
-#[cfg(not(wasm_browser))]
-use std::{sync::Mutex, time::Instant};
+#[cfg(target_os = "wasi")]
+use std::{
+    mem::ManuallyDrop,
+    net::UdpSocket,
+    os::fd::{AsRawFd, FromRawFd},
+};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
 
@@ -59,9 +63,8 @@ mod linux;
 #[path = "windows.rs"]
 mod imp;
 
-// No ECN support
-#[cfg(not(any(wasm_browser, unix, windows)))]
-#[path = "fallback.rs"]
+#[cfg(target_os = "wasi")]
+#[path = "wasi.rs"]
 mod imp;
 
 #[allow(unused_imports, unused_macros)]
@@ -159,14 +162,80 @@ pub struct Transmit<'a> {
     /// Contents of the datagram
     pub contents: &'a [u8],
     /// The segment size if this transmission contains multiple datagrams.
-    /// This is `None` if the transmit only contains a single datagram
-    /// and must be non-zero when set.
+    ///
+    /// This is `None` if the transmit only contains a single datagram.
+    /// A value of zero is treated like `None`.
     pub segment_size: Option<usize>,
     /// Optional source IP address for the datagram
     pub src_ip: Option<IpAddr>,
 }
 
 impl<'a> Transmit<'a> {
+    /// Returns the number of datagrams encoded by this transmit.
+    ///
+    /// A transmit without a `segment_size` always represents one datagram, including when its
+    /// contents are empty.
+    pub fn datagram_count(&self) -> usize {
+        match self.segment_size {
+            Some(size) if size != 0 && size < self.contents.len() => {
+                self.contents.len().div_ceil(size)
+            }
+            Some(_) | None => 1,
+        }
+    }
+
+    /// Advances this transmit by `sent` datagrams.
+    ///
+    /// Returns the unsent remainder, or `None` if the entire transmit was consumed. The returned
+    /// transmit borrows a suffix of the same payload; packet data is never copied.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::{io, net::UdpSocket};
+    ///
+    /// use quinn_udp::{Transmit, UdpSocketState};
+    ///
+    /// fn send_pending<'a>(
+    ///     state: &UdpSocketState,
+    ///     socket: &UdpSocket,
+    ///     pending: &mut Option<Transmit<'a>>,
+    /// ) -> io::Result<()> {
+    ///     while let Some(transmit) = pending.take() {
+    ///         match state.try_send(socket.into(), &transmit) {
+    ///             Ok(sent) => *pending = transmit.advance(sent),
+    ///             Err(error) => {
+    ///                 *pending = Some(transmit);
+    ///                 return Err(error);
+    ///             }
+    ///         }
+    ///     }
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn advance(mut self, sent: SendCount) -> Option<Self> {
+        let sent = sent.get();
+        let segment_size = match self.segment_size {
+            Some(size) if size != 0 && size < self.contents.len() => size,
+            Some(_) | None => {
+                debug_assert_eq!(sent, 1, "a single-datagram transmit must consume once");
+                return None;
+            }
+        };
+
+        debug_assert!(sent <= self.contents.len().div_ceil(segment_size));
+
+        let offset = sent.saturating_mul(segment_size);
+        if offset >= self.contents.len() {
+            return None;
+        }
+
+        self.contents = &self.contents[offset..];
+
+        Some(self)
+    }
+
     /// Computes the effective segment-size of the packet.
     ///
     /// Some (older) network drivers don't like being told to do GSO even if
@@ -184,48 +253,6 @@ impl<'a> Transmit<'a> {
             size if size >= self.contents.len() => None,
             size => Some(size),
         }
-    }
-
-    /// Returns the number of datagrams encoded by this transmit.
-    ///
-    /// A transmit without a `segment_size` always represents one datagram, including when its
-    /// contents are empty.
-    pub fn datagram_count(&self) -> usize {
-        match self.segment_size {
-            Some(0) => panic!("segment size must be non-zero"),
-            Some(size) if size < self.contents.len() => self.contents.len().div_ceil(size),
-            Some(_) | None => 1,
-        }
-    }
-
-    /// Advances this transmit by `sent` datagrams.
-    ///
-    /// Returns the unsent remainder, or `None` if the entire transmit was consumed. The returned
-    /// transmit borrows a suffix of the same payload; packet data is never copied.
-    pub fn advance(mut self, sent: SendCount) -> Option<Self> {
-        let sent = sent.get();
-        let segment_size = match self.segment_size {
-            Some(0) => {
-                debug_assert!(false, "segment size must be non-zero");
-                return None;
-            }
-            Some(size) if size < self.contents.len() => size,
-            Some(_) | None => {
-                debug_assert_eq!(sent, 1, "a single-datagram transmit must consume once");
-                return None;
-            }
-        };
-
-        debug_assert!(sent <= self.contents.len().div_ceil(segment_size));
-
-        let offset = sent.saturating_mul(segment_size);
-        if offset >= self.contents.len() {
-            return None;
-        }
-
-        self.contents = &self.contents[offset..];
-
-        Some(self)
     }
 
     /// Returns a transmit containing at most `max_datagrams.max(1)` leading datagrams.
@@ -327,7 +354,7 @@ pub enum TransportErrorPayload {
 
 /// Returns true if the given I/O error corresponds to a message size error
 ///
-/// Useful, for example, after invoking [`io::Error::last_os_error()`]
+/// Useful, for example, after invoking `std::io::Error::last_os_error()`
 /// to check if the last OS error was a message size error
 /// (EMSGSIZE on Unix, WSAEMSGSIZE on Windows).
 ///
@@ -351,40 +378,6 @@ pub fn is_msg_size_err(err: &io::Error) -> bool {
     }
 }
 
-/// Log at most 1 IO error per minute
-#[cfg(not(wasm_browser))]
-const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Logs a warning message when sendmsg fails
-///
-/// Logging will only be performed if at least [`IO_ERROR_LOG_INTERVAL`]
-/// has elapsed since the last error was logged.
-#[cfg(all(not(wasm_browser), any(feature = "tracing-log", feature = "log")))]
-fn log_sendmsg_error(
-    last_send_error: &Mutex<Instant>,
-    err: impl core::fmt::Debug,
-    transmit: &Transmit<'_>,
-) {
-    let now = Instant::now();
-    let last_send_error = &mut *last_send_error.lock().expect("poisend lock");
-    if now.saturating_duration_since(*last_send_error) > IO_ERROR_LOG_INTERVAL {
-        *last_send_error = now;
-        log::warn!(
-            "sendmsg error: {:?}, Transmit: {{ destination: {:?}, src_ip: {:?}, ecn: {:?}, len: {:?}, segment_size: {:?} }}",
-            err,
-            transmit.destination,
-            transmit.src_ip,
-            transmit.ecn,
-            transmit.contents.len(),
-            transmit.segment_size
-        );
-    }
-}
-
-// No-op
-#[cfg(not(any(wasm_browser, feature = "tracing-log", feature = "log")))]
-fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &Transmit<'_>) {}
-
 /// A borrowed UDP socket
 ///
 /// On Unix, constructible via `From<T: AsFd>`. On Windows, constructible via `From<T:
@@ -393,7 +386,26 @@ fn log_sendmsg_error(_: &Mutex<Instant>, _: impl core::fmt::Debug, _: &Transmit<
 #[cfg(not(wasm_browser))]
 pub struct UdpSockRef<'a>(socket2::SockRef<'a>);
 
-#[cfg(unix)]
+#[cfg(not(wasm_browser))]
+impl UdpSockRef<'_> {
+    /// Configures the socket for non-blocking or blocking operation.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        #[cfg(not(target_os = "wasi"))]
+        self.0.set_nonblocking(nonblocking)?;
+
+        #[cfg(target_os = "wasi")]
+        {
+            // socket2 uses `fcntl`, which WASI rejects; `std` uses `ioctl(FIONBIO)`.
+            // Safety: `self` outlives the borrow, and `ManuallyDrop` prevents a second close.
+            let borrowed = ManuallyDrop::new(unsafe { UdpSocket::from_raw_fd(self.0.as_raw_fd()) });
+            borrowed.set_nonblocking(nonblocking)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(any(unix, target_os = "wasi"))]
 impl<'s, S> From<&'s S> for UdpSockRef<'s>
 where
     S: AsFd,
@@ -488,6 +500,7 @@ mod tests {
 
         assert_eq!(make_transmit(&[], None).datagram_count(), 1);
         assert_eq!(make_transmit(&contents, None).datagram_count(), 1);
+        assert_eq!(make_transmit(&contents, Some(0)).datagram_count(), 1);
         assert_eq!(make_transmit(&contents, Some(20)).datagram_count(), 1);
     }
 
@@ -507,6 +520,11 @@ mod tests {
 
         assert!(
             make_transmit(&[], None)
+                .advance(SendCount::new(1).unwrap())
+                .is_none()
+        );
+        assert!(
+            make_transmit(&contents, Some(0))
                 .advance(SendCount::new(1).unwrap())
                 .is_none()
         );

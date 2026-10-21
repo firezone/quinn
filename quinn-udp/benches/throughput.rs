@@ -87,7 +87,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     send_socket.writable().await.unwrap();
                     let sent_datagrams = send_socket
                         .try_io(Interest::WRITABLE, || {
-                            send_state.send((&send_socket).into(), &pending)
+                            send_state.try_send((&send_socket).into(), &pending)
                         })
                         .unwrap();
                     let previous_len = pending.contents.len();
