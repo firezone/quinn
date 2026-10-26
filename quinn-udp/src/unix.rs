@@ -685,7 +685,7 @@ fn prepare_msg(
     hdr: &mut libc::msghdr,
     iov: &mut libc::iovec,
     ctrl: &mut cmsg::Aligned<[u8; cmsg::LEN]>,
-    #[allow(unused_variables)] // only used on FreeBSD & macOS
+    #[allow(unused_variables)] // only used on BSD & Solaris
     encode_src_ip: bool,
     sendmsg_einval: bool,
 ) {

@@ -79,6 +79,29 @@ fn basic_src_ip() {
     );
 }
 
+#[cfg(apple)]
+#[test]
+fn wildcard_socket_rejects_unassigned_source_ip() {
+    let send = Socket::from(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap());
+    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let state = UdpSocketState::new((&send).into()).unwrap();
+
+    let error = state
+        .try_send(
+            (&send).into(),
+            &Transmit {
+                destination: recv.local_addr().unwrap(),
+                ecn: None,
+                contents: b"hello",
+                segment_size: None,
+                src_ip: Some(Ipv4Addr::new(192, 0, 2, 1).into()),
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+}
+
 // The WASI backend sets no ECN codepoint and always reports `None`.
 #[test]
 #[cfg(not(target_os = "wasi"))]
