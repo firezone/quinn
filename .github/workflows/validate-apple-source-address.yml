@@ -32,3 +32,23 @@ jobs:
           else
             cargo test --locked -p quinn-udp --features "$FEATURES"
           fi
+      - name: Verify source-address test detects the original bug
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          git fetch --depth 1 origin ef279010009563889f7f91aa728e7f4dcee4d61b
+          git restore --source=ef279010009563889f7f91aa728e7f4dcee4d61b -- quinn-udp/src/unix.rs quinn-udp/src/apple_fast.rs
+          args=(--locked -p quinn-udp --test tests)
+          if [[ "$FEATURES" != default ]]; then args+=(--features "$FEATURES"); fi
+          if cargo test "${args[@]}" basic_src_ip -- --exact > regression.log 2>&1; then
+            cat regression.log
+            echo 'The source-address test unexpectedly passed before the fix' >&2
+            exit 1
+          fi
+          cat regression.log
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          output = Path('regression.log').read_text()
+          assert 'basic_src_ip ... FAILED' in output
+          assert 'Result::unwrap_err()' in output and 'Ok' in output
+          PYTHON
