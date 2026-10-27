@@ -1,0 +1,25 @@
+name: Validate Apple IP_TOS experiment
+
+on:
+  push:
+    branches: [experiment/apple-omit-empty-ip-tos]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Remove Homebrew Rustup proxies
+        run: |
+          if brew list --formula rustup >/dev/null 2>&1; then
+            brew uninstall --ignore-dependencies rustup
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test default UDP path
+        run: cargo test --locked -p quinn-udp
+      - name: Test Apple fast UDP path
+        run: cargo test --locked -p quinn-udp --features fast-apple-datapath
