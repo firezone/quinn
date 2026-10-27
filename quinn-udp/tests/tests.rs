@@ -58,7 +58,7 @@ fn state_before_bind() {
 
 #[test]
 fn basic_src_ip() {
-    for (src_ip, bind_ip) in [
+    for (recv_ip, bind_ip) in [
         (
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -68,11 +68,26 @@ fn basic_src_ip() {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         ),
     ] {
-        let recv = Socket::from(match UdpSocket::bind((src_ip, 0)) {
+        let recv = Socket::from(match UdpSocket::bind((recv_ip, 0)) {
             Ok(socket) => socket,
-            Err(_) if src_ip.is_ipv6() => continue,
+            Err(_) if recv_ip.is_ipv6() => continue,
             Err(error) => panic!("failed to bind IPv4 receiver: {error}"),
         });
+        let src_ip = if recv_ip.is_ipv4() {
+            let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+            // UDP connect selects a local route without transmitting a datagram.
+            route
+                .connect((Ipv4Addr::new(192, 0, 2, 1), 9))
+                .expect("IPv4 source override test requires a non-loopback IPv4 route");
+            let source = route.local_addr().unwrap().ip();
+            assert!(
+                !source.is_loopback() && !source.is_unspecified(),
+                "IPv4 source override test requires a non-loopback assigned address"
+            );
+            source
+        } else {
+            recv_ip
+        };
         let send = Socket::from(UdpSocket::bind((bind_ip, 0)).unwrap());
         let transmit = Transmit {
             destination: recv.local_addr().unwrap().as_socket().unwrap(),
@@ -81,23 +96,7 @@ fn basic_src_ip() {
             segment_size: None,
             src_ip: Some(src_ip),
         };
-        test_send_recv(&send, &recv, transmit.clone());
-
-        #[cfg(apple)]
-        if src_ip.is_ipv4() {
-            let state = UdpSocketState::new((&send).into()).unwrap();
-            let transmit = Transmit {
-                src_ip: Some(Ipv4Addr::new(192, 0, 2, 1).into()),
-                ..transmit
-            };
-            #[cfg(apple_fast)]
-            // SAFETY: sendmsg_x is available on the macOS test host.
-            unsafe {
-                state.set_apple_fast_path();
-            }
-            let error = state.try_send((&send).into(), &transmit).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
-        }
+        test_send_recv(&send, &recv, transmit);
     }
 }
 
@@ -401,6 +400,12 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
     let send_state = UdpSocketState::new(send.into()).unwrap();
     let recv_state = UdpSocketState::new(recv.into()).unwrap();
 
+    #[cfg(apple_fast)]
+    if transmit.src_ip.is_some() {
+        // SAFETY: sendmsg_x is available on the macOS test host.
+        unsafe { send_state.set_apple_fast_path() };
+    }
+
     // Reverse non-blocking flag set by `UdpSocketState` to make the test non-racy
     UdpSockRef::from(send).set_nonblocking(false).unwrap();
     UdpSockRef::from(recv).set_nonblocking(false).unwrap();
@@ -438,7 +443,16 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
         );
         let send_v6 = send.local_addr().unwrap().as_socket().unwrap().is_ipv6();
         let recv_v6 = recv.local_addr().unwrap().as_socket().unwrap().is_ipv6();
-        let mut addresses = vec![meta.addr.ip()];
+        let mut addresses = Vec::new();
+        if let Some(source) = transmit.src_ip {
+            assert_eq!(
+                ip_to_v6_mapped(meta.addr.ip()),
+                ip_to_v6_mapped(source),
+                "received source does not match the requested source"
+            );
+        } else {
+            addresses.push(meta.addr.ip());
+        }
         // Not populated on every OS. See `RecvMeta::dst_ip` for details.
         if let Some(addr) = meta.dst_ip {
             addresses.push(addr);
