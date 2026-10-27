@@ -155,6 +155,9 @@ fn prepare_msg_x(
     }
 
     encoder.finish();
+    if hdr.msg_controllen == 0 {
+        hdr.msg_control = std::ptr::null_mut();
+    }
 }
 
 /// Returns the `sendmsg_x` function pointer, resolving it via `dlsym` on first call
