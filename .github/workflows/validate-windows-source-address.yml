@@ -1,0 +1,17 @@
+name: Validate Windows UDP source addresses
+
+on:
+  push:
+    branches: [ci/validate-windows-source-address]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2022
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p quinn-udp --test tests basic_src_ip -- --exact
