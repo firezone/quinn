@@ -73,7 +73,7 @@ fn basic_src_ip() {
             Err(_) if recv_ip.is_ipv6() => continue,
             Err(error) => panic!("failed to bind IPv4 receiver: {error}"),
         });
-        let src_ip = if recv_ip.is_ipv4() {
+        let src_ip = if cfg!(apple) && recv_ip.is_ipv4() {
             let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
             // UDP connect selects a local route without transmitting a datagram.
             route
