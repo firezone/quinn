@@ -50,5 +50,6 @@ jobs:
           from pathlib import Path
           output = Path('regression.log').read_text()
           assert 'basic_src_ip ... FAILED' in output
-          assert 'Result::unwrap_err()' in output and 'Ok' in output
+          assert 'received source does not match the requested source' in output
+          assert '127.0.0.1' in output
           PYTHON
