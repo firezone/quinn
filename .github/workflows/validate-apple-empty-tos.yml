@@ -22,4 +22,13 @@ jobs:
       - name: Test default UDP path
         run: cargo test --locked -p quinn-udp
       - name: Test Apple fast UDP path
-        run: cargo test --locked -p quinn-udp --features fast-apple-datapath
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("quinn-udp/tests/tests.rs")
+          source = path.read_text()
+          original = "if transmit.src_ip.is_some() {"
+          assert source.count(original) == 1
+          path.write_text(source.replace(original, "{"))
+          PY
+          cargo test --locked -p quinn-udp --features fast-apple-datapath
