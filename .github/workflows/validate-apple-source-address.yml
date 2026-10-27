@@ -1,0 +1,34 @@
+name: Validate Apple UDP source addresses
+
+on:
+  push:
+    branches: [ci/validate-apple-source-address]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, fast-apple-datapath]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Remove Homebrew Rustup proxies
+        run: |
+          if brew list --formula rustup >/dev/null 2>&1; then
+            brew uninstall --ignore-dependencies rustup
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test quinn-udp
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: |
+          if [[ "$FEATURES" == default ]]; then
+            cargo test --locked -p quinn-udp
+          else
+            cargo test --locked -p quinn-udp --features "$FEATURES"
+          fi
