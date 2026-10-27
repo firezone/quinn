@@ -58,25 +58,32 @@ fn state_before_bind() {
 
 #[test]
 fn basic_src_ip() {
-    let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let recv = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let src_ip = send.local_addr().unwrap().ip();
-    let dst_addr = recv.local_addr().unwrap();
-    test_send_recv(
-        &send.into(),
-        &recv.into(),
-        Transmit {
-            destination: dst_addr,
+    for (recv_ip, bind_ip) in [
+        (
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        ),
+        (
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ),
+    ] {
+        let recv = Socket::from(match UdpSocket::bind((recv_ip, 0)) {
+            Ok(socket) => socket,
+            Err(_) if recv_ip.is_ipv6() => continue,
+            Err(error) => panic!("failed to bind IPv4 receiver: {error}"),
+        });
+        let src_ip = recv_ip;
+        let send = Socket::from(UdpSocket::bind((bind_ip, 0)).unwrap());
+        let transmit = Transmit {
+            destination: recv.local_addr().unwrap().as_socket().unwrap(),
             ecn: None,
             contents: b"hello",
             segment_size: None,
             src_ip: Some(src_ip),
-        },
-    );
+        };
+        test_send_recv(&send, &recv, transmit);
+    }
 }
 
 // The WASI backend sets no ECN codepoint and always reports `None`.
@@ -379,6 +386,12 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
     let send_state = UdpSocketState::new(send.into()).unwrap();
     let recv_state = UdpSocketState::new(recv.into()).unwrap();
 
+    #[cfg(apple_fast)]
+    if transmit.src_ip.is_some() {
+        // SAFETY: sendmsg_x is available on the macOS test host.
+        unsafe { send_state.set_apple_fast_path() };
+    }
+
     // Reverse non-blocking flag set by `UdpSocketState` to make the test non-racy
     UdpSockRef::from(send).set_nonblocking(false).unwrap();
     UdpSockRef::from(recv).set_nonblocking(false).unwrap();
@@ -416,7 +429,16 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
         );
         let send_v6 = send.local_addr().unwrap().as_socket().unwrap().is_ipv6();
         let recv_v6 = recv.local_addr().unwrap().as_socket().unwrap().is_ipv6();
-        let mut addresses = vec![meta.addr.ip()];
+        let mut addresses = Vec::new();
+        if let Some(source) = transmit.src_ip {
+            assert_eq!(
+                ip_to_v6_mapped(meta.addr.ip()),
+                ip_to_v6_mapped(source),
+                "received source does not match the requested source"
+            );
+        } else {
+            addresses.push(meta.addr.ip());
+        }
         // Not populated on every OS. See `RecvMeta::dst_ip` for details.
         if let Some(addr) = meta.dst_ip {
             addresses.push(addr);
