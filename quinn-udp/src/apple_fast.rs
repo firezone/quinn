@@ -123,7 +123,7 @@ fn prepare_msg_x(
     let is_ipv4 = transmit.destination.is_ipv4()
         || matches!(transmit.destination.ip(), IpAddr::V6(addr) if addr.to_ipv4_mapped().is_some());
     if is_ipv4 {
-        if !sendmsg_einval {
+        if !sendmsg_einval && transmit.ecn.is_some() {
             encoder.push(libc::IPPROTO_IP, libc::IP_TOS, ecn as IpTosTy);
         }
     } else {
