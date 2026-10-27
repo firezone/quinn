@@ -58,48 +58,47 @@ fn state_before_bind() {
 
 #[test]
 fn basic_src_ip() {
-    let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let recv = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let src_ip = send.local_addr().unwrap().ip();
-    let dst_addr = recv.local_addr().unwrap();
-    test_send_recv(
-        &send.into(),
-        &recv.into(),
-        Transmit {
-            destination: dst_addr,
+    for (src_ip, bind_ip) in [
+        (
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        ),
+        (
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ),
+    ] {
+        let recv = Socket::from(match UdpSocket::bind((src_ip, 0)) {
+            Ok(socket) => socket,
+            Err(_) if src_ip.is_ipv6() => continue,
+            Err(error) => panic!("failed to bind IPv4 receiver: {error}"),
+        });
+        let send = Socket::from(UdpSocket::bind((bind_ip, 0)).unwrap());
+        let transmit = Transmit {
+            destination: recv.local_addr().unwrap().as_socket().unwrap(),
             ecn: None,
             contents: b"hello",
             segment_size: None,
             src_ip: Some(src_ip),
-        },
-    );
-}
+        };
+        test_send_recv(&send, &recv, transmit.clone());
 
-#[cfg(apple)]
-#[test]
-fn wildcard_socket_rejects_unassigned_source_ip() {
-    let send = Socket::from(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap());
-    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let state = UdpSocketState::new((&send).into()).unwrap();
-
-    let error = state
-        .try_send(
-            (&send).into(),
-            &Transmit {
-                destination: recv.local_addr().unwrap(),
-                ecn: None,
-                contents: b"hello",
-                segment_size: None,
+        #[cfg(apple)]
+        if src_ip.is_ipv4() {
+            let state = UdpSocketState::new((&send).into()).unwrap();
+            let transmit = Transmit {
                 src_ip: Some(Ipv4Addr::new(192, 0, 2, 1).into()),
-            },
-        )
-        .unwrap_err();
-
-    assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+                ..transmit
+            };
+            #[cfg(apple_fast)]
+            // SAFETY: sendmsg_x is available on the macOS test host.
+            unsafe {
+                state.set_apple_fast_path();
+            }
+            let error = state.try_send((&send).into(), &transmit).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        }
+    }
 }
 
 // The WASI backend sets no ECN codepoint and always reports `None`.
