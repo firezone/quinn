@@ -79,6 +79,86 @@ fn basic_src_ip() {
     );
 }
 
+#[test]
+#[cfg(apple)]
+fn ipv4_source_address_override() {
+    let Some(src_ip) = alternate_ipv4_address() else {
+        eprintln!("skipping source override test: no alternate assigned IPv4 address");
+        return;
+    };
+
+    let send = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    recv.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let send_state = UdpSocketState::new((&send).into()).unwrap();
+    #[cfg(apple_fast)]
+    // SAFETY: sendmsg_x is available on the macOS test host.
+    unsafe {
+        send_state.set_apple_fast_path();
+    }
+    UdpSockRef::from(&send).set_nonblocking(false).unwrap();
+
+    let contents = b"hello";
+    let sent = send_state
+        .try_send(
+            (&send).into(),
+            &Transmit {
+                destination: recv.local_addr().unwrap(),
+                ecn: None,
+                contents,
+                segment_size: None,
+                src_ip: Some(src_ip.into()),
+            },
+        )
+        .unwrap();
+    assert_eq!(sent.get(), 1);
+
+    let mut buf = [0; 32];
+    let (received, source) = recv.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..received], contents);
+    assert_eq!(source.ip(), src_ip);
+}
+
+#[cfg(apple)]
+fn alternate_ipv4_address() -> Option<Ipv4Addr> {
+    // SAFETY: getifaddrs returns a null-terminated list with sockaddr entries matching
+    // their address family. The list remains valid until freeifaddrs below.
+    unsafe {
+        let mut interfaces = std::ptr::null_mut();
+        if libc::getifaddrs(&mut interfaces) != 0 {
+            panic!("getifaddrs failed: {}", io::Error::last_os_error());
+        }
+
+        let mut current = interfaces;
+        let mut result = None;
+        while let Some(interface) = current.as_ref() {
+            current = interface.ifa_next;
+            let Some(address) = interface.ifa_addr.as_ref() else {
+                continue;
+            };
+            if interface.ifa_flags & libc::IFF_UP as u32 == 0
+                || i32::from(address.sa_family) != libc::AF_INET
+            {
+                continue;
+            }
+            let address = &*interface.ifa_addr.cast::<libc::sockaddr_in>();
+            let ip = Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes());
+            if ip == Ipv4Addr::LOCALHOST
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+            {
+                continue;
+            }
+            result = Some(ip);
+            break;
+        }
+        libc::freeifaddrs(interfaces);
+        result
+    }
+}
+
 // The WASI backend sets no ECN codepoint and always reports `None`.
 #[test]
 #[cfg(not(target_os = "wasi"))]
