@@ -79,6 +79,50 @@ fn basic_src_ip() {
     );
 }
 
+#[test]
+#[cfg(apple)]
+fn ipv4_source_address_override() {
+    let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    // UDP connect selects a local route without transmitting a datagram.
+    route
+        .connect((Ipv4Addr::new(192, 0, 2, 1), 9))
+        .expect("source override test requires a non-loopback IPv4 route");
+    let src_ip = route.local_addr().unwrap().ip();
+    assert!(!src_ip.is_loopback() && !src_ip.is_unspecified());
+
+    let send = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    recv.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let send_state = UdpSocketState::new((&send).into()).unwrap();
+    #[cfg(apple_fast)]
+    // SAFETY: sendmsg_x is available on the macOS test host.
+    unsafe {
+        send_state.set_apple_fast_path();
+    }
+    UdpSockRef::from(&send).set_nonblocking(false).unwrap();
+
+    let contents = b"hello";
+    let sent = send_state
+        .try_send(
+            (&send).into(),
+            &Transmit {
+                destination: recv.local_addr().unwrap(),
+                ecn: None,
+                contents,
+                segment_size: None,
+                src_ip: Some(src_ip),
+            },
+        )
+        .unwrap();
+    assert_eq!(sent.get(), 1);
+
+    let mut buf = [0; 32];
+    let (received, source) = recv.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[..received], contents);
+    assert_eq!(source.ip(), src_ip);
+}
+
 // The WASI backend sets no ECN codepoint and always reports `None`.
 #[test]
 #[cfg(not(target_os = "wasi"))]
