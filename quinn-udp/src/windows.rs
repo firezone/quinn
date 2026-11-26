@@ -1,7 +1,7 @@
 use std::{
     io::{self, IoSliceMut},
     mem::{self, MaybeUninit},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::windows::io::AsRawSocket,
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
@@ -9,6 +9,10 @@ use std::{
 
 use libc::{c_int, c_uint};
 use windows_sys::Win32::Networking::WinSock;
+
+#[cfg(feature = "windows-rio")]
+#[path = "windows_rio.rs"]
+mod rio;
 
 use crate::{
     EcnCodepoint, RecvMeta, SendCount, Transmit, UdpSockRef,
@@ -34,6 +38,9 @@ pub struct UdpSocketState {
 
     /// `WSARecvMsg`, resolved for this socket's Winsock provider.
     wsa_recvmsg: WsaRecvMsg,
+
+    #[cfg(feature = "windows-rio")]
+    rio: Option<rio::RioRecv>,
 }
 
 impl UdpSocketState {
@@ -159,7 +166,52 @@ impl UdpSocketState {
             ecn_v4_supported,
             ecn_v6_supported,
             wsa_recvmsg,
+            #[cfg(feature = "windows-rio")]
+            rio: None,
         })
+    }
+
+    /// Switches receiving to Registered I/O (RIO), keeping `slots` receives of up to
+    /// `max_datagram_size` bytes posted at all times.
+    ///
+    /// The socket must have been created with `WSA_FLAG_REGISTERED_IO` and be bound. On error,
+    /// receives stay on `WSARecvMsg`.
+    ///
+    /// Once enabled, datagrams no longer reach the socket's regular receive buffer, so the
+    /// runtime's readiness never fires for them: wait with [`Self::poll_recv_ready`] instead.
+    /// The socket must be closed before this state is dropped, as RIO's buffers stay registered
+    /// with it until then.
+    #[cfg(feature = "windows-rio")]
+    pub fn enable_rio(
+        &mut self,
+        socket: UdpSockRef<'_>,
+        slots: usize,
+        max_datagram_size: usize,
+    ) -> io::Result<()> {
+        self.rio = Some(rio::RioRecv::new(&*socket.0, slots, max_datagram_size)?);
+
+        Ok(())
+    }
+
+    /// Whether receiving uses Registered I/O, see [`Self::enable_rio`].
+    #[cfg(feature = "windows-rio")]
+    pub fn is_rio(&self) -> bool {
+        self.rio.is_some()
+    }
+
+    /// Waits until a RIO receive may have completed.
+    ///
+    /// Wakeups may be spurious: [`Self::recv`] then returns [`io::ErrorKind::WouldBlock`].
+    /// Without RIO, this is always ready; use the runtime's readiness instead.
+    #[cfg(feature = "windows-rio")]
+    pub fn poll_recv_ready(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &self.rio {
+            Some(rio) => rio.poll_recv_ready(cx),
+            None => std::task::Poll::Ready(Ok(())),
+        }
     }
 
     /// Enable or disable receive offloading.
@@ -170,6 +222,14 @@ impl UdpSocketState {
     ///
     /// Disabled by default on Windows due to <https://github.com/quinn-rs/quinn/issues/2041>.
     pub fn set_gro(&self, socket: UdpSockRef<'_>, enable: bool) -> io::Result<()> {
+        #[cfg(feature = "windows-rio")]
+        if enable && self.rio.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "URO is not supported with RIO receives",
+            ));
+        }
+
         set_socket_option(
             &*socket.0,
             WinSock::IPPROTO_UDP,
@@ -207,6 +267,11 @@ impl UdpSocketState {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
+        #[cfg(feature = "windows-rio")]
+        if let Some(rio) = &self.rio {
+            return rio.recv(bufs, meta);
+        }
+
         // we cannot use [`socket2::MsgHdrMut`] as we do not have access to inner field which holds the WSAMSG
         let mut ctrl_buf = cmsg::Aligned([0; CMSG_LEN]);
         let mut source: WinSock::SOCKADDR_INET = unsafe { mem::zeroed() };
@@ -243,63 +308,16 @@ impl UdpSocketState {
             }
         }
 
-        let addr = unsafe {
-            let (_, addr) = socket2::SockAddr::try_init(|addr_storage, len| {
-                *len = size_of_val(&source) as _;
-                ptr::copy_nonoverlapping(&source, addr_storage as _, 1);
-                Ok(())
-            })?;
-            addr.as_socket()
-        };
-
-        // Decode control messages (PKTINFO and ECN)
-        let mut ecn_bits = 0;
-        let mut dst_ip = None;
-        let mut interface_index = None;
-        let mut stride = len;
-
-        let cmsg_iter = unsafe { cmsg::Iter::new(&wsa_msg) };
-        for cmsg in cmsg_iter {
-            const UDP_COALESCED_INFO: i32 = WinSock::UDP_COALESCED_INFO as i32;
-            // [header (len)][data][padding(len + sizeof(data))] -> [header][data][padding]
-            match (cmsg.cmsg_level, cmsg.cmsg_type) {
-                (WinSock::IPPROTO_IP, WinSock::IP_PKTINFO) => {
-                    let pktinfo = unsafe { cmsg.decode::<WinSock::IN_PKTINFO>() };
-                    // Addr is stored in big endian format
-                    let ip4 = Ipv4Addr::from(u32::from_be(unsafe { pktinfo.ipi_addr.S_un.S_addr }));
-                    dst_ip = Some(ip4.into());
-                    interface_index = Some(pktinfo.ipi_ifindex);
-                }
-                (WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO) => {
-                    let pktinfo = unsafe { cmsg.decode::<WinSock::IN6_PKTINFO>() };
-                    // Addr is stored in big endian format
-                    dst_ip = Some(IpAddr::from(unsafe { pktinfo.ipi6_addr.u.Byte }));
-                    interface_index = Some(pktinfo.ipi6_ifindex);
-                }
-                (WinSock::IPPROTO_IP, WinSock::IP_ECN) => {
-                    // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
-                    ecn_bits = unsafe { cmsg.decode::<c_int>() };
-                }
-                (WinSock::IPPROTO_IPV6, WinSock::IPV6_ECN) => {
-                    // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
-                    ecn_bits = unsafe { cmsg.decode::<c_int>() };
-                }
-                (WinSock::IPPROTO_UDP, UDP_COALESCED_INFO) => {
-                    // Has type u32 (aka DWORD) per
-                    // https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-udp-socket-options
-                    stride = unsafe { cmsg.decode::<u32>() };
-                }
-                _ => {}
-            }
-        }
+        let addr = sockaddr_inet_to_std(&source)?;
+        let control = unsafe { decode_control(&wsa_msg) };
 
         meta[0] = RecvMeta {
             len: len as usize,
-            stride: stride as usize,
-            addr: addr.unwrap(),
-            ecn: EcnCodepoint::from_bits(ecn_bits as u8),
-            dst_ip,
-            interface_index,
+            stride: control.stride.map_or(len as usize, |s| s as usize),
+            addr,
+            ecn: EcnCodepoint::from_bits(control.ecn_bits as u8),
+            dst_ip: control.dst_ip,
+            interface_index: control.interface_index,
             timestamp: None,
         };
         Ok(1)
@@ -321,6 +339,11 @@ impl UdpSocketState {
     /// Returns 1 if the platform doesn't support GRO.
     #[inline]
     pub fn gro_segments(&self) -> usize {
+        #[cfg(feature = "windows-rio")]
+        if self.rio.is_some() {
+            return 1;
+        }
+
         // Arbitrary reasonable value inspired by Linux and msquic
         64
     }
@@ -457,6 +480,78 @@ fn send(
     }
 }
 
+/// What the control messages of a received datagram carry.
+pub(crate) struct Control {
+    pub(crate) ecn_bits: c_int,
+    pub(crate) dst_ip: Option<IpAddr>,
+    pub(crate) interface_index: Option<u32>,
+    pub(crate) stride: Option<u32>,
+}
+
+/// Decodes the control messages (PKTINFO, ECN and URO segment size) of a received datagram.
+///
+/// # Safety
+///
+/// `wsa_msg.Control` must describe a valid, aligned control buffer as filled in by Winsock.
+pub(crate) unsafe fn decode_control(wsa_msg: &WinSock::WSAMSG) -> Control {
+    let mut control = Control {
+        ecn_bits: 0,
+        dst_ip: None,
+        interface_index: None,
+        stride: None,
+    };
+
+    let cmsg_iter = unsafe { cmsg::Iter::new(wsa_msg) };
+    for cmsg in cmsg_iter {
+        const UDP_COALESCED_INFO: i32 = WinSock::UDP_COALESCED_INFO as i32;
+        // [header (len)][data][padding(len + sizeof(data))] -> [header][data][padding]
+        match (cmsg.cmsg_level, cmsg.cmsg_type) {
+            (WinSock::IPPROTO_IP, WinSock::IP_PKTINFO) => {
+                let pktinfo = unsafe { cmsg.decode::<WinSock::IN_PKTINFO>() };
+                // Addr is stored in big endian format
+                let ip4 = Ipv4Addr::from(u32::from_be(unsafe { pktinfo.ipi_addr.S_un.S_addr }));
+                control.dst_ip = Some(ip4.into());
+                control.interface_index = Some(pktinfo.ipi_ifindex);
+            }
+            (WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO) => {
+                let pktinfo = unsafe { cmsg.decode::<WinSock::IN6_PKTINFO>() };
+                // Addr is stored in big endian format
+                control.dst_ip = Some(IpAddr::from(unsafe { pktinfo.ipi6_addr.u.Byte }));
+                control.interface_index = Some(pktinfo.ipi6_ifindex);
+            }
+            (WinSock::IPPROTO_IP, WinSock::IP_ECN) => {
+                // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
+                control.ecn_bits = unsafe { cmsg.decode::<c_int>() };
+            }
+            (WinSock::IPPROTO_IPV6, WinSock::IPV6_ECN) => {
+                // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
+                control.ecn_bits = unsafe { cmsg.decode::<c_int>() };
+            }
+            (WinSock::IPPROTO_UDP, UDP_COALESCED_INFO) => {
+                // Has type u32 (aka DWORD) per
+                // https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-udp-socket-options
+                control.stride = Some(unsafe { cmsg.decode::<u32>() });
+            }
+            _ => {}
+        }
+    }
+
+    control
+}
+
+pub(crate) fn sockaddr_inet_to_std(source: &WinSock::SOCKADDR_INET) -> io::Result<SocketAddr> {
+    let (_, addr) = unsafe {
+        socket2::SockAddr::try_init(|addr_storage, len| {
+            *len = size_of_val(source) as _;
+            ptr::copy_nonoverlapping(source, addr_storage as _, 1);
+            Ok(())
+        })
+    }?;
+
+    addr.as_socket()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unexpected address family"))
+}
+
 /// Reads a socket option into a zero-initialized `T`.
 ///
 /// # Safety
@@ -505,9 +600,12 @@ fn set_socket_option(
     }
 }
 
+#[cfg(not(feature = "windows-rio"))]
 pub(crate) const BATCH_SIZE: usize = 1;
+#[cfg(feature = "windows-rio")]
+pub(crate) const BATCH_SIZE: usize = 32;
 // Enough to store max(IP_PKTINFO + IP_ECN, IPV6_PKTINFO + IPV6_ECN) + max(UDP_SEND_MSG_SIZE, UDP_COALESCED_INFO) bytes (header + data) and some extra margin
-const CMSG_LEN: usize = 128;
+pub(crate) const CMSG_LEN: usize = 128;
 const OPTION_ON: u32 = 1;
 
 /// Names the function type inside [`WinSock::LPFN_WSARECVMSG`] without restating its signature.

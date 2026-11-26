@@ -19,6 +19,8 @@ tracing-log = ["tracing/log"]
 log = ["dep:log"]
 # Support private Apple APIs to send multiple packets in a single syscall.
 fast-apple-datapath = []
+# Receive through Windows Registered I/O, see `UdpSocketState::enable_rio`.
+windows-rio = ["windows-sys/Win32_System_Threading", "windows-sys/Win32_Security"]
 
 [dependencies]
 libc = "0.2.175"
