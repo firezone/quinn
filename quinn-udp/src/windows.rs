@@ -40,11 +40,24 @@ pub struct UdpSocketState {
     wsa_recvmsg: WsaRecvMsg,
 
     #[cfg(feature = "windows-rio")]
-    rio: Option<rio::RioRecv>,
+    rio: Option<rio::Rio>,
 }
 
 impl UdpSocketState {
     pub fn new(socket: UdpSockRef<'_>) -> io::Result<Self> {
+        Self::new_inner(socket, true)
+    }
+
+    /// Like [`Self::new`], for a socket created with `WSA_FLAG_REGISTERED_IO`.
+    ///
+    /// Such sockets refuse non-blocking mode, so they are left as they are. Call
+    /// [`Self::enable_rio`] once the socket is bound; RIO's requests never block.
+    #[cfg(feature = "windows-rio")]
+    pub fn new_for_rio(socket: UdpSockRef<'_>) -> io::Result<Self> {
+        Self::new_inner(socket, false)
+    }
+
+    fn new_inner(socket: UdpSockRef<'_>, nonblocking: bool) -> io::Result<Self> {
         assert!(
             CMSG_LEN
                 >= WinSock::CMSGHDR::cmsg_space(size_of::<WinSock::IN6_PKTINFO>())
@@ -56,7 +69,9 @@ impl UdpSocketState {
             "control message buffers will be misaligned"
         );
 
-        socket.0.set_nonblocking(true)?;
+        if nonblocking {
+            socket.0.set_nonblocking(true)?;
+        }
         let info = unsafe {
             get_socket_option::<WinSock::WSAPROTOCOL_INFOW>(
                 &*socket.0,
@@ -171,24 +186,31 @@ impl UdpSocketState {
         })
     }
 
-    /// Switches receiving to Registered I/O (RIO), keeping `slots` receives of up to
-    /// `max_datagram_size` bytes posted at all times.
+    /// Switches sending and receiving to Registered I/O (RIO), keeping `recv_slots` receives of
+    /// up to `max_datagram_size` bytes posted at all times and allowing `send_slots` datagrams of
+    /// at most that size in flight.
     ///
-    /// The socket must have been created with `WSA_FLAG_REGISTERED_IO` and be bound. On error,
-    /// receives stay on `WSARecvMsg`.
+    /// The socket must have been created with `WSA_FLAG_REGISTERED_IO` (see
+    /// [`Self::new_for_rio`]) and be bound.
     ///
-    /// Once enabled, datagrams no longer reach the socket's regular receive buffer, so the
-    /// runtime's readiness never fires for them: wait with [`Self::poll_recv_ready`] instead.
-    /// The socket must be closed before this state is dropped, as RIO's buffers stay registered
-    /// with it until then.
+    /// Once enabled, the socket is not usable with a runtime's readiness: wait with
+    /// [`Self::poll_recv_ready`] and [`Self::poll_send_ready`] instead. Sends are split into
+    /// individual datagrams. The socket must be closed before this state is dropped, as RIO's
+    /// buffers stay registered with it until then.
     #[cfg(feature = "windows-rio")]
     pub fn enable_rio(
         &mut self,
         socket: UdpSockRef<'_>,
-        slots: usize,
+        recv_slots: usize,
+        send_slots: usize,
         max_datagram_size: usize,
     ) -> io::Result<()> {
-        self.rio = Some(rio::RioRecv::new(&*socket.0, slots, max_datagram_size)?);
+        self.rio = Some(rio::Rio::new(
+            &*socket.0,
+            recv_slots,
+            send_slots,
+            max_datagram_size,
+        )?);
 
         Ok(())
     }
@@ -197,6 +219,21 @@ impl UdpSocketState {
     #[cfg(feature = "windows-rio")]
     pub fn is_rio(&self) -> bool {
         self.rio.is_some()
+    }
+
+    /// Waits until a RIO send slot may be free.
+    ///
+    /// Wakeups may be spurious: [`Self::try_send`] then returns [`io::ErrorKind::WouldBlock`].
+    /// Without RIO, this is always ready; use the runtime's readiness instead.
+    #[cfg(feature = "windows-rio")]
+    pub fn poll_send_ready(
+        &self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &self.rio {
+            Some(rio) => rio.poll_send_ready(cx),
+            None => std::task::Poll::Ready(Ok(())),
+        }
     }
 
     /// Waits until a RIO receive may have completed.
@@ -250,6 +287,12 @@ impl UdpSocketState {
         socket: UdpSockRef<'_>,
         transmit: &Transmit<'_>,
     ) -> io::Result<SendCount> {
+        #[cfg(feature = "windows-rio")]
+        if let Some(rio) = &self.rio {
+            let sent = rio.send(transmit, self.ecn_v4_supported, self.ecn_v6_supported)?;
+            return Ok(SendCount::from_datagram_count(sent));
+        }
+
         let transmit = transmit.limit(self.max_gso_segments());
         let sent = send(
             socket,
@@ -408,11 +451,42 @@ fn send(
         dwFlags: 0,
     };
 
-    // Add control messages (ECN and PKTINFO)
-    let mut encoder = unsafe { cmsg::Encoder::new(&mut wsa_msg) };
+    // Add control messages (ECN, PKTINFO and USO segment size)
+    unsafe { encode_control(&mut wsa_msg, transmit, ecn_v4_supported, ecn_v6_supported) }?;
+
+    let mut len = 0;
+    let rc = unsafe {
+        WinSock::WSASendMsg(
+            socket.0.as_raw_socket() as usize,
+            &wsa_msg,
+            0,
+            &mut len,
+            ptr::null_mut(),
+            None,
+        )
+    };
+
+    match rc {
+        0 => Ok(transmit.datagram_count()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Encodes the control messages (PKTINFO, ECN and USO segment size) for sending `transmit`.
+///
+/// # Safety
+///
+/// `wsa_msg.Control` must describe a writable, aligned buffer of at least [`CMSG_LEN`] bytes.
+pub(crate) unsafe fn encode_control(
+    wsa_msg: &mut WinSock::WSAMSG,
+    transmit: &Transmit<'_>,
+    ecn_v4_supported: bool,
+    ecn_v6_supported: bool,
+) -> io::Result<()> {
+    let mut encoder = unsafe { cmsg::Encoder::new(wsa_msg) };
 
     if let Some(ip) = transmit.src_ip {
-        let ip = std::net::SocketAddr::new(ip, 0);
+        let ip = SocketAddr::new(ip, 0);
         let ip = socket2::SockAddr::from(ip);
         match ip.family() {
             WinSock::AF_INET => {
@@ -462,22 +536,7 @@ fn send(
 
     encoder.finish();
 
-    let mut len = 0;
-    let rc = unsafe {
-        WinSock::WSASendMsg(
-            socket.0.as_raw_socket() as usize,
-            &wsa_msg,
-            0,
-            &mut len,
-            ptr::null_mut(),
-            None,
-        )
-    };
-
-    match rc {
-        0 => Ok(transmit.datagram_count()),
-        _ => Err(io::Error::last_os_error()),
-    }
+    Ok(())
 }
 
 /// What the control messages of a received datagram carry.
