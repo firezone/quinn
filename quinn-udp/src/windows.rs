@@ -187,15 +187,16 @@ impl UdpSocketState {
     }
 
     /// Switches sending and receiving to Registered I/O (RIO), keeping `recv_slots` receives of
-    /// up to `max_datagram_size` bytes posted at all times and allowing `send_slots` datagrams of
-    /// at most that size in flight.
+    /// up to `max_recv_size` bytes posted at all times and allowing `send_slots` sends of up to
+    /// `max_send_size` bytes in flight.
     ///
     /// The socket must have been created with `WSA_FLAG_REGISTERED_IO` (see
     /// [`Self::new_for_rio`]) and be bound.
     ///
     /// Once enabled, the socket is not usable with a runtime's readiness: wait with
-    /// [`Self::poll_recv_ready`] and [`Self::poll_send_ready`] instead. Sends are split into
-    /// individual datagrams. The socket must be closed before this state is dropped, as RIO's
+    /// [`Self::poll_recv_ready`] and [`Self::poll_send_ready`] instead. Sends use USO unless RIO
+    /// rejects it, in which case they are split into individual datagrams.
+    /// The socket must be closed before this state is dropped, as RIO's
     /// buffers stay registered with it until then.
     #[cfg(feature = "windows-rio")]
     pub fn enable_rio(
@@ -203,13 +204,15 @@ impl UdpSocketState {
         socket: UdpSockRef<'_>,
         recv_slots: usize,
         send_slots: usize,
-        max_datagram_size: usize,
+        max_recv_size: usize,
+        max_send_size: usize,
     ) -> io::Result<()> {
         self.rio = Some(rio::Rio::new(
             &*socket.0,
             recv_slots,
             send_slots,
-            max_datagram_size,
+            max_recv_size,
+            max_send_size,
         )?);
 
         Ok(())
